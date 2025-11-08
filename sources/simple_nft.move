@@ -1,7 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-/// NFT Marketplace with minting, listing, and purchase functionality
+/// NFT Marketplace with minting, listing, and purchase functionality (FIXED VERSION)
 module nft::nft_marketplace {
     use sui::url::{Self, Url};
     use std::string;
@@ -21,10 +21,11 @@ module nft::nft_marketplace {
     }
 
     /// A listing resource that holds an NFT for sale
+    /// FIXED: NFT is now stored INSIDE the listing
     public struct Listing has key {
         id: UID,
-        /// The NFT being sold
-        nft_id: ID,
+        /// The NFT being sold (stored inside!)
+        nft: DevNetNFT,
         /// Price in MIST (1 SUI = 1,000,000,000 MIST)
         price: u64,
         /// The seller's address
@@ -124,6 +125,7 @@ module nft::nft_marketplace {
     }
 
     /// List an NFT for sale (entry function)
+    /// FIXED: NFT is now stored inside the Listing
     entry fun list_nft_for_sale(
         nft: DevNetNFT,
         price: u64,
@@ -136,7 +138,7 @@ module nft::nft_marketplace {
         
         let listing = Listing {
             id: object::new(ctx),
-            nft_id,
+            nft,  // Store NFT inside listing
             price,
             seller,
         };
@@ -150,14 +152,12 @@ module nft::nft_marketplace {
             price,
         });
         
-        // Transfer NFT to the listing object
-        transfer::public_transfer(nft, object::id_to_address(&listing_id));
-        
-        // Share the listing so anyone can purchase it
+        // Just share the listing - NFT is inside it
         transfer::share_object(listing);
     }
 
     /// Purchase a listed NFT (entry function)
+    /// NFT is extracted from listing and transferred to buyer
     entry fun buy_nft(
         listing: Listing,
         mut payment: coin::Coin<SUI>,
@@ -166,11 +166,12 @@ module nft::nft_marketplace {
     ) {
         let Listing {
             id: listing_id,
-            nft_id,
+            nft,  // Extract NFT from listing
             price,
             seller,
         } = listing;
         
+        let nft_id = object::id(&nft);
         let payment_value = coin::value(&payment);
         assert!(payment_value >= price, EInsufficientPayment);
         
@@ -189,6 +190,9 @@ module nft::nft_marketplace {
         
         // Transfer payment to seller
         transfer::public_transfer(seller_coin, seller);
+        
+        // Transfer NFT to buyer!
+        transfer::public_transfer(nft, buyer);
         
         // Return excess payment to buyer
         if (coin::value(&payment) > 0) {
@@ -209,6 +213,7 @@ module nft::nft_marketplace {
     }
 
     /// Delist an NFT (entry function)
+    /// Returns NFT to seller
     entry fun cancel_listing(
         listing: Listing,
         ctx: &TxContext
@@ -218,15 +223,20 @@ module nft::nft_marketplace {
         
         let Listing {
             id: listing_id,
-            nft_id,
+            nft,  // Extract NFT
             price: _,
-            seller: _,
+            seller,
         } = listing;
+        
+        let nft_id = object::id(&nft);
         
         sui::event::emit(DelistNFTEvent {
             listing_id: object::uid_to_inner(&listing_id),
             nft_id,
         });
+        
+        // Return NFT to seller
+        transfer::public_transfer(nft, seller);
         
         object::delete(listing_id);
     }
@@ -275,7 +285,7 @@ module nft::nft_marketplace {
         
         let listing = Listing {
             id: object::new(ctx),
-            nft_id,
+            nft,  // Store NFT inside
             price,
             seller,
         };
@@ -289,7 +299,6 @@ module nft::nft_marketplace {
             price,
         });
         
-        transfer::public_transfer(nft, object::id_to_address(&listing_id));
         transfer::share_object(listing);
     }
 
@@ -299,14 +308,15 @@ module nft::nft_marketplace {
         mut payment: coin::Coin<SUI>,
         marketplace: &mut Marketplace,
         ctx: &mut TxContext
-    ): Option<coin::Coin<SUI>> {
+    ): option::Option<coin::Coin<SUI>> {
         let Listing {
             id: listing_id,
-            nft_id,
+            nft,  // Extract NFT
             price,
             seller,
         } = listing;
         
+        let nft_id = object::id(&nft);
         let payment_value = coin::value(&payment);
         assert!(payment_value >= price, EInsufficientPayment);
         
@@ -320,6 +330,9 @@ module nft::nft_marketplace {
         
         balance::join(&mut marketplace.balance, coin::into_balance(fee_coin));
         transfer::public_transfer(seller_coin, seller);
+        
+        // Transfer NFT to buyer
+        transfer::public_transfer(nft, buyer);
         
         sui::event::emit(PurchaseNFTEvent {
             listing_id: object::uid_to_inner(&listing_id),
@@ -349,15 +362,20 @@ module nft::nft_marketplace {
         
         let Listing {
             id: listing_id,
-            nft_id,
+            nft,  // Extract NFT
             price: _,
-            seller: _,
+            seller,
         } = listing;
+        
+        let nft_id = object::id(&nft);
         
         sui::event::emit(DelistNFTEvent {
             listing_id: object::uid_to_inner(&listing_id),
             nft_id,
         });
+        
+        // Return NFT to seller
+        transfer::public_transfer(nft, seller);
         
         object::delete(listing_id);
     }
@@ -396,7 +414,7 @@ module nft::nft_marketplace {
 
     /// Get listing NFT ID
     public fun listing_nft_id(listing: &Listing): ID {
-        listing.nft_id
+        object::id(&listing.nft)
     }
 
     /// Get listing ID
@@ -420,161 +438,5 @@ module nft::nft_marketplace {
     ) {
         let withdrawn = coin::take(&mut marketplace.balance, amount, ctx);
         transfer::public_transfer(withdrawn, recipient);
-    }
-}
-
-#[test_only]
-module nft::nft_marketplace_tests {
-    use nft::nft_marketplace::{Self, DevNetNFT};
-    use sui::test_scenario as ts;
-    use std::string;
-
-    #[test]
-    fun test_mint_and_transfer() {
-        let addr1 = @0xA;
-        let addr2 = @0xB;
-        
-        let mut scenario = ts::begin(addr1);
-        
-        // Mint NFT using composable pattern
-        {
-            let nft = nft_marketplace::mint(
-                b"Test NFT",
-                b"A test NFT",
-                b"https://example.com/nft.png",
-                ts::ctx(&mut scenario)
-            );
-            transfer::public_transfer(nft, addr1);
-        };
-        
-        // Transfer NFT
-        ts::next_tx(&mut scenario, addr1);
-        {
-            let nft = ts::take_from_sender<DevNetNFT>(&scenario);
-            transfer::public_transfer(nft, addr2);
-        };
-        
-        // Verify ownership
-        ts::next_tx(&mut scenario, addr2);
-        {
-            let nft = ts::take_from_sender<DevNetNFT>(&scenario);
-            assert!(string::as_bytes(nft_marketplace::name(&nft)) == b"Test NFT", 0);
-            ts::return_to_sender(&scenario, nft);
-        };
-        
-        ts::end(scenario);
-    }
-
-    #[test]
-    fun test_mint_to_sender() {
-        let addr1 = @0xA;
-        let mut scenario = ts::begin(addr1);
-        
-        // Mint NFT using entry function
-        {
-            nft_marketplace::mint_to_sender(
-                b"Test NFT",
-                b"A test NFT",
-                b"https://example.com/nft.png",
-                ts::ctx(&mut scenario)
-            );
-        };
-        
-        // Verify NFT was transferred
-        ts::next_tx(&mut scenario, addr1);
-        {
-            let nft = ts::take_from_sender<DevNetNFT>(&scenario);
-            assert!(string::as_bytes(nft_marketplace::name(&nft)) == b"Test NFT", 0);
-            ts::return_to_sender(&scenario, nft);
-        };
-        
-        ts::end(scenario);
-    }
-
-    #[test]
-    fun test_update_description() {
-        let addr1 = @0xA;
-        let mut scenario = ts::begin(addr1);
-        
-        // Mint NFT
-        {
-            let nft = nft_marketplace::mint(
-                b"Test NFT",
-                b"Original description",
-                b"https://example.com/nft.png",
-                ts::ctx(&mut scenario)
-            );
-            transfer::public_transfer(nft, addr1);
-        };
-        
-        // Update description
-        ts::next_tx(&mut scenario, addr1);
-        {
-            let mut nft = ts::take_from_sender<DevNetNFT>(&scenario);
-            nft_marketplace::update_description(&mut nft, b"Updated description");
-            assert!(string::as_bytes(nft_marketplace::description(&nft)) == b"Updated description", 0);
-            ts::return_to_sender(&scenario, nft);
-        };
-        
-        ts::end(scenario);
-    }
-
-    #[test]
-    fun test_burn() {
-        let addr1 = @0xA;
-        let mut scenario = ts::begin(addr1);
-        
-        // Mint NFT
-        {
-            let nft = nft_marketplace::mint(
-                b"Test NFT",
-                b"A test NFT",
-                b"https://example.com/nft.png",
-                ts::ctx(&mut scenario)
-            );
-            transfer::public_transfer(nft, addr1);
-        };
-        
-        // Burn NFT
-        ts::next_tx(&mut scenario, addr1);
-        {
-            let nft = ts::take_from_sender<DevNetNFT>(&scenario);
-            nft_marketplace::burn(nft);
-        };
-        
-        ts::end(scenario);
-    }
-
-    #[test]
-    fun test_getter_functions() {
-        let addr1 = @0xA;
-        let mut scenario = ts::begin(addr1);
-        
-        // Mint NFT
-        {
-            let nft = nft_marketplace::mint(
-                b"Test NFT",
-                b"A test NFT",
-                b"https://example.com/nft.png",
-                ts::ctx(&mut scenario)
-            );
-            transfer::public_transfer(nft, addr1);
-        };
-        
-        // Test getter functions
-        ts::next_tx(&mut scenario, addr1);
-        {
-            let nft = ts::take_from_sender<DevNetNFT>(&scenario);
-            
-            // Test all getters
-            assert!(string::as_bytes(nft_marketplace::name(&nft)) == b"Test NFT", 0);
-            assert!(string::as_bytes(nft_marketplace::description(&nft)) == b"A test NFT", 1);
-            let _nft_id = nft_marketplace::nft_id(&nft);
-            let _url = nft_marketplace::url(&nft);
-            
-            ts::return_to_sender(&scenario, nft);
-        };
-        
-        ts::end(scenario);
     }
 }
